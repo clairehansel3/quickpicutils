@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+
+import argparse
+import daemon
+import functools
+import h5py
+import json
+import matplotlib.colors as colors
+import matplotlib.pyplot as plt
+import multiprocessing
+import numpy as np
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+
+def make_plot(args, vmax, kpn1, n0, frames_folder, beam_or_species_or_field, enumeration):
+    i, path = enumeration
+    print(f'--> plotting {path}')
+    units_dictionary = {
+        'normalized': (1.0, '$k_p^{-1}$'),
+        'm': (kpn1, 'm'),
+        'cm': (kpn1 * 1e2, 'cm'),
+        'mm': (kpn1 * 1e3, 'mm'),
+        'um': (kpn1 * 1e6, '$\\mu$m'),
+        'nm': (kpn1 * 1e9, 'nm'),
+        'pm': (kpn1 * 1e12, 'pm')
+    }
+    xy_units, xy_units_label = units_dictionary[args['xy_units'][0]]
+    z_units, z_units_label = units_dictionary[args['z_units'][0]]
+    with h5py.File(path, 'r') as f:
+        distance_cm = 1e2 * kpn1 * f.attrs['TIME'][0]
+        xymin, xymax = f['AXIS']['AXIS1']
+        zmin, zmax = f['AXIS']['AXIS2']
+        item_name = f'{args["field"][0]}slice{args["slice"][0]}' if beam_or_species_or_field == 'field' else f'charge_slice_{args["slice"][0]}'
+        arr = np.array(f[item_name])
+        if beam_or_species_or_field != 'field':
+            arr = np.abs(arr)
+
+    xymin *= xy_units
+    xymax *= xy_units
+    zmin *= z_units
+    zmax *= z_units
+    xy, dxy = np.linspace(xymin, xymax, arr.shape[1], retstep=True, endpoint=False)
+    z, dz = np.linspace(zmin, zmax, arr.shape[0], retstep=True, endpoint=False)
+    xymid = np.linspace(xymin - 0.5 * dxy, xymax + 0.5 * dxy, arr.shape[1] + 1)
+    zmid = np.linspace(zmin - 0.5 * dz, zmax + 0.5 * dz, arr.shape[0] + 1)
+
+    if args['style'] is not None:
+        style = args['style'][0]
+        if beam_or_species_or_field == 'field':
+            if style not in ('PiYG', 'PRGn', 'BrBG', 'PuOr', 'RdGy', 'RdBu', 'RdYlGn', 'Spectral', 'coolwarm', 'bwr', 'seismic'):
+                if i == 0:
+                    print(f'\033[1;93mWarning:\033[0m Diverging color styles are recommended for fields (PiYG, PRGn, BrBG, PuOr, RdGy, RdBu, RdYlGn, Spectral, coolwarm, bwr, or seismic).')
+        else:
+            if style not in ('PiYG', 'PRGn', 'BrBG', 'PuOr', 'RdGy', 'RdBu', 'RdYlGn', 'Spectral', 'coolwarm', 'bwr', 'seismic'):
+                if i == 0:
+                    print(f'\033[1;93mWarning:\033[0m Non-diverging, perceptually uniform color styles are recommended for densities (viridis, plasma, inferno, magma, or cividis).')
+    else:
+        style = 'seismic' if beam_or_species_or_field == 'field' else 'inferno'
+
+    if beam_or_species_or_field == 'field':
+        if args['field'][0] in ('ex', 'ey', 'ez'):
+            multiplier = 0.5109989500015e6 / kpn1
+            cbarlabel = f'$E_{args["field"][0][1]}$ (V/m)'
+        elif args['field'][0] in ('bx', 'by', 'bz'):
+            multiplier = 1.0
+            cbarlabel = f'$B_{args["field"][0][1]}$ (?)'
+        elif args['field'][0] == 'psi':
+            multiplier = 1.0
+            cbarlabel = '$\\psi$ ($m_e c^2$)'
+    else:
+        multiplier = n0
+        cbarlabel = 'Number Density ($\\mathrm{cm}^{-3}$)'
+
+    vmin2 = -vmax if beam_or_species_or_field == 'field' else 0.0
+    vmax2 = vmax if beam_or_species_or_field == 'field' else (0.0 if vmax is None else vmax)
+    vmin2 *= multiplier
+    vmax2 *= multiplier
+
+    if args["logscale"][0] == "off":
+        plt.pcolormesh(zmid, xymid, multiplier * arr.T, vmin=vmin2, vmax=vmax2, cmap=style)
+    else:
+        assert beam_or_species_or_field != 'field'
+        plt.pcolormesh(zmid, xymid, multiplier * arr.T, cmap=style, norm=colors.LogNorm(n0 / 100, vmax2))
+    plt.xlabel(f'$\\xi = ct - z$ ({z_units_label})')
+    plt.ylabel(f'${args["slice"][0][0]}$ ({xy_units_label})')
+    plt.xlim(float(args['z_window'][0]) if args['z_window'][0] != 'auto' else zmin, float(args['z_window'][1]) if args['z_window'][1] != 'auto' else zmax)
+    plt.ylim(float(args['xy_window'][0]) if args['xy_window'][0] != 'auto' else xymin, float(args['xy_window'][1]) if args['xy_window'][1] != 'auto' else xymax)
+    cbar = plt.colorbar().set_label(cbarlabel, rotation=270, labelpad=20)
+    plt.title((args['title'][0] + ', ' if args['title'] is not None else '') + f'$z = {distance_cm:.1f}$cm')
+    plt.savefig(frames_folder / f'{beam_or_species_or_field}_{args[beam_or_species_or_field][0]}_{i}.png', dpi=200)
+    plt.clf()
+
+def run(args):
+
+    # Read qpinput.json and get plasma angular wavenumber
+    try:
+        with open('qpinput.json', 'r') as f:
+            qpinput_text = f.read()
+            qpinput_text = re.sub(r'!.*\n', r'\n', qpinput_text)
+            qpinput_text = re.sub(",[ \t\r\n]+}", "}", qpinput_text)
+            qpinput_text = re.sub(",[ \t\r\n]+\]", "]", qpinput_text)
+            qpinput = json.loads(qpinput_text)
+            n0 = qpinput['simulation']['n0']
+            kpn1 = 299792458 / np.sqrt(n0 * 100 * 100 * 100 * 1.602176634e-19 * 1.602176634e-19 / (9.109383701528e-31 * 8.854187812813e-12))
+    except FileNotFoundError:
+        print(f'\033[1;31mError:\033[0m Unable to find qpinput.json, are you in the right directory?')
+        sys.exit(1)
+
+    # Get data files
+    if args['field'] is None:
+        if args['beam'] is not None and args['species'] is None:
+            beam_or_species_or_field = 'beam'
+            directory = pathlib.Path(f'Beam{args["beam"][0]:04d}')
+        elif args['beam'] is None and args['species'] is not None:
+            beam_or_species_or_field = 'species'
+            directory = pathlib.Path(f'Species{args["species"][0]:04d}')
+        else:
+            assert False
+        if not directory.is_dir():
+            print(f'\033[1;31mError:\033[0m You are either in the wrong directory or {beam_or_species_or_field} {args[beam_or_species_or_field][0]} does not exist.')
+            sys.exit(1)
+        directory.resolve(strict=True)
+        startswith_name = f'charge_slice_{args["slice"][0]}'
+    else:
+        assert args['beam'] is None and args['species'] is None
+        beam_or_species_or_field = 'field'
+        directory = pathlib.Path('Fields')
+        if not directory.is_dir():
+            print(f'\033[1;31mError:\033[0m You are either in the wrong directory or the "Fields" directory does not exist.')
+            sys.exit(1)
+        directory.resolve(strict=True)
+        startswith_name = f'{args["field"][0]}slice{args["slice"][0]}'
+    for possible_data_file in (possible_data_file for subdir in directory.iterdir() for possible_data_file in subdir.iterdir()):
+        if possible_data_file.name.startswith(startswith_name):
+            directory = possible_data_file.parent
+            break
+    else:
+        print(f'\033[1;31mError:\033[0m Slice {args["slice"][0]} does not exist.')
+        sys.exit(1)
+
+    data_files = list(directory.iterdir())
+    data_files.sort(key=lambda path: int(path.name[-11:-3]))
+    data_files = data_files[1:]
+    if args['ignore_last']:
+        data_files = data_files[:-1]
+    if args['frames'][0] != 'all':
+        stride = len(data_files) // int(args['frames'][0])
+        if stride == 0:
+            stride = 1
+        data_files = data_files[::stride]
+
+    # Compute vmax (if needed)
+    if args['scale'][0] == 'variable':
+        vmax = None
+    else:
+        print('--> determining peak density for color scale ')
+        assert args['scale'][0] == 'fixed'
+        vmax = 0.0
+        for file in data_files:
+            with h5py.File(file, 'r') as f:
+                item_name = f'{args["field"][0]}slice{args["slice"][0]}' if beam_or_species_or_field == 'field' else f'charge_slice_{args["slice"][0]}'
+                if beam_or_species_or_field == 'field':
+                    arr = np.array(f[f'{args["field"][0]}slice{args["slice"][0]}'])
+                else:
+                    arr = np.array(f[f'charge_slice_{args["slice"][0]}'])
+                vmax = max(vmax, np.max(np.abs(arr)))
+
+    # Get output
+    if args['out'][0] == 'auto':
+        output = pathlib.Path(f'{beam_or_species_or_field}_{args[beam_or_species_or_field][0]}.mp4')
+    else:
+        output = pathlib.Path(args['out'][0])
+    if not output.name.endswith('.mp4'):
+        print(f'\033[1;31mError:\033[0m Output {output} must be a .mp4.')
+        sys.exit(1)
+    if output.is_dir():
+        print(f'\033[1;31mError:\033[0m Output location {output} exists and is a directory.')
+        sys.exit(1)
+    if output.is_file():
+        output.unlink()
+
+    def begin_threads(frames_folder):
+        # Begin Parallel Threads
+        print('--> initializing threads')
+        processes = args['threads'][0]
+        if processes > len(data_files):
+            processes = len(data_files)
+        with multiprocessing.Pool(processes) as pool:
+            print('--> plotting frames')
+            partial = functools.partial(make_plot, args, vmax, kpn1, n0, frames_folder, beam_or_species_or_field)
+            for result in pool.imap_unordered(partial, enumerate(data_files), processes):
+                pass
+        print('--> plotting completed')
+        print('--> creating movie')
+        subprocess.run(['ffmpeg', '-i', str(frames_folder / f'{beam_or_species_or_field}_{args[beam_or_species_or_field][0]}_%d.png'), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', output], check=True, capture_output=True)
+        print('--> done')
+
+    if args['frames_folder'][0] == 'none':
+        with tempfile.TemporaryDirectory() as dir:
+            frames_folder = pathlib.Path(dir).resolve(strict=True)
+            begin_threads(frames_folder)
+    else:
+        frames_folder = pathlib.Path(args['frames_folder'][0])
+        if not frames_folder.is_dir():
+            frames_folder.mkdir(parents=True)
+        frames_folder.resolve(strict=True)
+        begin_threads(frames_folder)
+
+def main():
+    # Parse Arguments
+    parser = argparse.ArgumentParser(description='Animates QuickPIC Results')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--beam', nargs=1, type=int, help='Animate a beam.')
+    group.add_argument('--species', nargs=1, type=int, help='Animate a species.')
+    group.add_argument('--field', nargs=1, choices=('ex', 'ey', 'ez', 'bx', 'by', 'bz', 'psi'), help='Animate a field.')
+    parser.add_argument('--slice', nargs=1, default=('xz',), choices=('xz', 'yz'), help='Which slice to plot. (default: xz)')
+    parser.add_argument('--detach', action='store_true', help='Runs the program as a background process. Creates the script "qpic-movie.kill" which when run will kill the qpic-movie process. qpic-movie.kill will be deleted when qpic-movie exits. Output is written to qpic-movie.log.')
+    parser.add_argument('--threads', nargs=1, default=(1,), type=int, help='Number of threads to run on in parallel. (default: 1)')
+    parser.add_argument('--frames', nargs=1, default=('all',), help='The number of frames to plot, or "all" to plot all frames. This is usually just an approximation (setting this to 100 might cause 104 frames to be generated). (default: all)')
+    parser.add_argument('--xy-units', nargs=1, default=('normalized',), choices=('m', 'cm', 'mm', 'um', 'nm', 'pm', 'normalized'), help='Units for the transverse dimension. (default: normalized)')
+    parser.add_argument('--z-units', nargs=1, default=('normalized',), choices=('m', 'cm', 'mm', 'um', 'nm', 'pm', 'normalized'), help='Units for the longitudinal dimension. (default: normalized)')
+    parser.add_argument('--xy-window', nargs=2, default=('auto', 'auto'), help='Transverse window lower and upper limit. (default: auto auto)')
+    parser.add_argument('--z-window', nargs=2, default=('auto', 'auto'), help='Longitudinal window lower and upper limit. (default: auto auto)')
+    parser.add_argument('--style', nargs=1, help='Heat map style. (default: inferno for densities and seismic for fields)')
+    parser.add_argument('--title', nargs=1, help='Plot title. (default: None)')
+    parser.add_argument('--scale', nargs=1, default=('fixed',), choices=('variable', 'fixed'), help='Whether the scale changes for each frame or is fixed for the entire movie. (default: fixed)')
+    parser.add_argument('--ignore-last', action='store_true', help='Ignores the last frame. This should be used when plotting results of simulations which are currently running.')
+    parser.add_argument('--frames-folder', nargs=1, default=('none',), help='Path to a folder to store the frames. If no folder exists at the specified location one is created. If "none" is given frames are put in a temporary directory and deleted after. (default: none)')
+    parser.add_argument('--logscale', nargs=1, default=('off',), choices=('off', 'on'), help='Make the heatmap a log scale (default: off)')
+    parser.add_argument('--out', nargs=1, default=('auto',), help='Where to put the movie that is created. (default: standard name such as beam_1.mp4 or field_by.mp4)')
+    args = vars(parser.parse_args())
+
+    # Detach if necessary
+    if args['detach']:
+        with open('qpic-movie.log', 'w+') as log:
+            with daemon.DaemonContext(stdout=log, stderr=log, working_directory=pathlib.Path.cwd()):
+                with open('qpic-movie.kill', 'w+') as kill:
+                    kill.write(f'#!/bin/bash\nkill -SIGINT {os.getpid()}\n')
+                subprocess.run(['chmod', '+x', 'qpic-movie.kill'], check=True)
+                try:
+                    run(args)
+                    pathlib.Path('qpic-movie.kill').unlink()
+                except:
+                    pathlib.Path('qpic-movie.kill').unlink()
+                    raise
+    else:
+        run(args)
+
+if __name__ == '__main__':
+    main()
